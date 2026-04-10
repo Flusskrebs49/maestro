@@ -2,6 +2,11 @@
 #coding: utf-8
 
 import paho.mqtt.client as mqtt
+import websocket
+try:
+	import thread
+except ImportError:
+	import _thread as thread
 import time
 import sys
 import os
@@ -9,16 +14,11 @@ import json
 import logging
 import datetime
 from logging.handlers import RotatingFileHandler
-import websocket
-try:
-	import thread
-except ImportError:
-	import _thread as thread
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s :: %(levelname)s :: %(message)s')
-file_handler = RotatingFileHandler('activity1.log', 'a', 1000000, 1)
+file_handler = RotatingFileHandler('activity.log', 'a', 1000000, 1)
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
@@ -68,15 +68,9 @@ class PileFifo(object):
 Message_MQTT=PileFifo()
 Message_WS=PileFifo()
 
-# SIO CONNECT TO MCZ MAESTRO
-from pprint import pprint
-import socketio
-
-sio = socketio.Client(logger=True, engineio_logger=True)
-MCZ_device_serial = "votreserial"
-MCZ_device_MAC = "votremac"
-MCZ_App_URL = "http://app.mcz.it:9000"
-
+# MCZ MAESTRO
+from _config_ import _MCZip
+from _config_ import _MCZport
 _INTERVALLE = 1
 _TEMPS_SESSION = 60
 
@@ -107,76 +101,55 @@ def on_message_mqtt(client, userdata, message):
 		cmd[1]=(int(cmd[1])*2)
 	Message_MQTT.empile("C|WriteParametri|"+cmd[0]+"|"+str(cmd[1]))
 	logger.info('Contenu Pile Message_MQTT : ' + str(Message_MQTT.copiepile()))
-	send()
 
 def secTOdhms(nb_sec):
 	qm,s=divmod(nb_sec,60)
 	qh,m=divmod(qm,60)
 	d,h=divmod(qh,24)
 	return "%d:%d:%d:%d" %(d,h,m,s)
-
-@sio.event
-def connect():
-	pprint("Connected")
-	pprint("SID is : {}".format(sio.sid))
-	sio.emit(
-	    "join",
-	    {
-	        "serialNumber": MCZ_device_serial,
-	        "macAddress": MCZ_device_MAC,
-	        "type": "Android-App",
-	    },
-	)
-	sio.emit(
-	    "chiedo",
-	    {
-	        "serialNumber": MCZ_device_serial,
-	        "macAddress": MCZ_device_MAC,
-	        "tipoChiamata": 0,
-	        "richiesta": "RecuperoParametri",
-	    },
-	)
-	sio.emit(
-	    "chiedo",
-	    {
-	        "serialNumber": MCZ_device_serial,
-	        "macAddress": MCZ_device_MAC,
-	        "tipoChiamata": 1,
-	        "richiesta": "C|RecuperoInfo",
-	    },
-	)
-
-@sio.event
-def disconnect():
-	pprint("Disconnected")
-
-@sio.event
-def rispondo(response):
-	pprint("Received 'rispondo' message")
-	datas = response["stringaRicevuta"].split("|")
+	
+def on_message(ws, message):
+	logger.info('Message sur le serveur websocket reçu : ' + str(message))
 	from _data_ import RecuperoInfo
-	for i in range(0,len(datas)):
+	for i in range(0,len(message.split("|"))):
 			for j in range(0,len(RecuperoInfo)):
 				if i == RecuperoInfo[j][0]:
 					if len(RecuperoInfo[j]) > 2:
 						for k in range(0,len(RecuperoInfo[j][2])):
-							if int(datas[i],16) == RecuperoInfo[j][2][k][0]:
+							if int(message.split("|")[i],16) == RecuperoInfo[j][2][k][0]:
 								MQTT_MAESTRO[RecuperoInfo[j][1]] = RecuperoInfo[j][2][k][1]
 								break
 							else:
-								MQTT_MAESTRO[RecuperoInfo[j][1]] = ('Code inconnu :', str(int(datas[i],16)))
+								MQTT_MAESTRO[RecuperoInfo[j][1]] = ('Code inconnu :', str(int(message.split("|")[i],16)))
 					else:
 						if i == 6 or i == 26 or i == 28:
-							MQTT_MAESTRO[RecuperoInfo[j][1]] = float(int(datas[i], 16))/2
+							MQTT_MAESTRO[RecuperoInfo[j][1]] = float(int(message.split("|")[i], 16))/2
 						
 						elif i >= 37 and i <=42:
-							MQTT_MAESTRO[RecuperoInfo[j][1]] = secTOdhms(int(datas[i],16))
+							MQTT_MAESTRO[RecuperoInfo[j][1]] = secTOdhms(int(message.split("|")[i],16))
 						else:
-							MQTT_MAESTRO[RecuperoInfo[j][1]] = int(datas[i],16)
+							MQTT_MAESTRO[RecuperoInfo[j][1]] = int(message.split("|")[i],16)
 	logger.info('Publication sur le topic MQTT ' + str(_MQTT_TOPIC_PUB) + ' le message suivant : ' + str(json.dumps(MQTT_MAESTRO)))
 	client.publish(_MQTT_TOPIC_PUB, json.dumps(MQTT_MAESTRO),1)
 
-sio.connect(MCZ_App_URL)
+def on_error(ws, error):
+	logger.info(error)
+
+def on_close(ws):
+	logger.info('Session websocket fermée')
+
+def on_open(ws):
+	def run(*args):
+		for i in range(_TEMPS_SESSION):
+			time.sleep(_INTERVALLE)
+			if Message_MQTT.pilevide():
+				Message_MQTT.empile("C|RecuperoInfo")
+			cmd = Message_MQTT.depile()
+			logger.info("Envoi de la commande : " + str(cmd))
+			ws.send(cmd)
+		time.sleep(1)
+		ws.close()
+	thread.start_new_thread(run, ())
 
 logger.info('Connection en cours au broker MQTT (IP:'+_MQTT_ip + ' PORT:'+str(_MQTT_port)+')')
 client = mqtt.Client()
@@ -189,42 +162,14 @@ client.loop_start()
 logger.info('Souscription au topic ' + str(_MQTT_TOPIC_SUB) + ' avec un Qos=1')
 client.subscribe(_MQTT_TOPIC_SUB, qos=1)
 
-
-def receive(*args):
+if __name__ == "__main__":
 	while True:
-		time.sleep(30)
-		logger.info("Envoi de la commande pour rafraichir les donnees")
-		sio.emit(
-		    "chiedo",
-		    {
-		        "serialNumber": MCZ_device_serial,
-		        "macAddress": MCZ_device_MAC,
-		        "tipoChiamata": 1,
-		        "richiesta": "C|RecuperoInfo",
-		    },
-		)
-	time.sleep(15)
-	
-thread.start_new_thread(receive, ())
-			
-
-def send():
-	def run(*args):
-		
+		logger.info("Etablissement d'une nouvelle connection au serveur websocket (IP:"+_MCZip+" PORT:"+_MCZport+")")
+		websocket.enableTrace(False)
+		ws = websocket.WebSocketApp("ws://" + _MCZip + ":" + _MCZport,
+									on_message = on_message,
+									on_error = on_error,
+									on_close = on_close)
+		ws.on_open = on_open
+		ws.run_forever()
 		time.sleep(_INTERVALLE)
-		if Message_MQTT.pilevide():
-			Message_MQTT.empile("C|RecuperoInfo")
-		cmd = Message_MQTT.depile()
-		logger.info("Envoi de la commande : " + str(cmd))
-		sio.emit(
-		    "chiedo",
-		    {
-		        "serialNumber": MCZ_device_serial,
-		        "macAddress": MCZ_device_MAC,
-		        "tipoChiamata": 1,
-		        "richiesta": cmd,
-		    },
-		)
-			
-	thread.start_new_thread(run, ())
-
